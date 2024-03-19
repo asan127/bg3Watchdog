@@ -5,109 +5,125 @@ import (
 	"log"
 	"os"
 	"os/exec"
-	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/mitchellh/go-ps"
-	"github.com/muesli/termenv"
-)
-
-const (
-	checkInterval = 10 * time.Second // Check every 10 seconds
+	"github.com/charmbracelet/bubbles/spinner"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	ps "github.com/mitchellh/go-ps"
+	"github.com/spf13/viper"
 )
 
 var (
-	targetAppPath string
-	targetAppName string
+	LauncherDwell time.Duration
+	PollInterval  time.Duration
+	Debug         bool
 )
 
-func main() {
-	output := termenv.NewOutput(os.Stdout)
+type AppConfig struct {
+	SteamPath            string `mapstructure:"steam_path"`
+	Bg3AppId             int    `mapstructure:"bg3_app_id"`
+	LauncherDwellSeconds int    `mapstructure:"launcher_dwell_seconds"`
+	MainAppPollSeconds   int    `mapstructure:"main_app_poll_seconds"`
+	Debug                bool   `mapstructure:"debug"`
+}
 
-	if len(os.Args) < 2 {
-		fmt.Println(output.String("Usage: ./sidecar <full_path_to_application>"))
+func main() {
+	// Initialize Viper
+	viper.SetConfigName("config")
+	viper.SetConfigType("yaml")
+	viper.AddConfigPath(".")
+	viper.SetDefault("steam_path", "C:\\Program Files (x86)\\Steam\\steam.exe")
+	viper.SetDefault("bg3_app_id", 1086940)
+	viper.SetDefault("launcher_dwell_seconds", 10)
+	viper.SetDefault("main_app_poll_seconds", 5)
+	viper.SetDefault("debug", false)
+
+	// Read or create configuration
+	if err := readOrCreateConfig(); err != nil {
+		fmt.Println("Error:", err)
 		os.Exit(1)
 	}
 
-	targetAppPath = os.Args[1]
-	targetAppName = filepath.Base(targetAppPath)
+	// Unmarshal configuration into struct
+	var cfg AppConfig
+	if err := viper.Unmarshal(&cfg); err != nil {
+		fmt.Println("Error unmarshaling config:", err)
+		os.Exit(2)
+	}
 
-	// var launcherStarted = false
+	LauncherDwell = time.Duration(cfg.LauncherDwellSeconds) * time.Second
+	PollInterval = time.Duration(cfg.MainAppPollSeconds) * time.Second
+	Debug = cfg.Debug
 
-	// var bg3 ps.Process
+	if Debug {
+		fmt.Printf("Waiting %s after launching before monitoring...\n", LauncherDwell)
+		fmt.Printf("Check every %s after launch dwell time for app closure...\n\n", PollInterval)
+	}
 
-	// if err := launchApp(targetAppPath); err != nil {
-	// 	fmt.Printf("Failed to launch '%s': %v\n", targetAppName, err)
-	// 	os.Exit(1)
-	// }
+	if !isAppRunning() {
+		launchApp(cfg.SteamPath, cfg.Bg3AppId)
+	}
 
-	var cmd exec.Cmd
-
-	for {
-
-		if !isAppRunning() {
-			fmt.Printf("Target application '%s' is not running, launching...\n", targetAppName)
-
-			cmd := exec.Command(targetAppPath)
-			err := cmd.Start()
-			if err != nil {
-				panic(err)
-			}
-
-			fmt.Printf("PID: %d\n", cmd.Process.Pid)
-
-			// if err := launchApp(targetAppPath); err != nil {
-			// 	fmt.Printf("Failed to launch '%s': %v\n", targetAppName, err)
-			// 	os.Exit(1)
-			// }
-		}
-
-		fmt.Println("Waiting for the thing to close...")
-		err := cmd.Wait()
-
-		log.Printf("Command finished with error: %v", err)
-
-		fmt.Printf("Sleeping for %d seconds...", checkInterval)
-		time.Sleep(checkInterval)
+	if _, err := tea.NewProgram(initialModel()).Run(); err != nil {
+		fmt.Println("Error running program:", err)
+		os.Exit(1)
 	}
 }
 
-// func main() {
-//     for {
-//         if !isAppRunning() {
-//             fmt.Printf("Target application '%s' is not running, launching...\n", targetAppName)
-//             if err := launchApp(); err != nil {
-//                 fmt.Printf("Failed to launch '%s': %v\n", targetAppName, err)
-//                 os.Exit(1)
-//             }
-//         }
-//         time.Sleep(checkInterval)
-//     }
-// }
-
-func isAppRunning() bool {
-	return getProcess(targetAppName) != nil
+func initialModel() model {
+	s := spinner.New()
+	s.Spinner = spinner.Dot
+	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
+	return model{
+		spinner:       s,
+		appRunning:    true,
+		lastCheckTime: time.Now(),
+		checkInterval: LauncherDwell,
+	}
 }
 
-func getProcess(targetAppName string) ps.Process {
+func launchApp(SteamPath string, Bg3AppId int) {
+	cmd := exec.Command(SteamPath, "-applaunch", strconv.Itoa(Bg3AppId))
+
+	if err := cmd.Start(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func isAppRunning() bool {
 	processes, err := ps.Processes()
 	if err != nil {
-		fmt.Printf("Error getting processes: %v\n", err)
+		return false
 	}
 
 	for _, proc := range processes {
-		if strings.Contains(proc.Executable(), targetAppName) {
-			return proc
+		if strings.Contains(proc.Executable(), "bg3.exe") || strings.Contains(proc.Executable(), "bg3_dx11.exe") {
+			return true
 		}
 	}
 
-	return nil
+	return false
 }
 
-func launchApp(targetAppPath string) error {
-	cmd := exec.Command(targetAppPath)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Start()
+func readOrCreateConfig() error {
+	// Check if the config file exists
+	if _, err := os.Stat("config.yaml"); os.IsNotExist(err) {
+		// Write default configuration if file doesn't exist
+		if err := viper.SafeWriteConfigAs("config.yaml"); err != nil {
+			return err
+		}
+		fmt.Println("Default config file created: config.yaml")
+	} else if err != nil {
+		return err
+	}
+
+	// Read configuration from file
+	if err := viper.ReadInConfig(); err != nil {
+		return err
+	}
+
+	return nil
 }
